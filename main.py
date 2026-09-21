@@ -148,7 +148,7 @@ def schedule_bonus():
         # 🧪 ТЕСТ: каждый аккаунт отправляет один раз через 2 минуты (+0.3с между аккаунтами)
         log.info("🧪 TEST_MODE: рассылка один раз через 2 минуты")
         for i, (idx, c) in enumerate(clients):
-            delay_sec = 120 + i * 0.3
+            delay_sec = 20 + i * 0.3
             run_at = datetime.now(BONUS_TZ) + timedelta(seconds=delay_sec)
             scheduler.add_job(
                 send_bonus_one,
