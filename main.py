@@ -3,6 +3,7 @@ import asyncio
 import random
 import logging
 from io import BytesIO
+from datetime import datetime, timedelta
 
 import cv2
 import numpy as np
@@ -24,6 +25,11 @@ BONUS_MINUTE = int(os.environ.get("BONUS_MINUTE", 7))
 BONUS_TZ = zoneinfo.ZoneInfo("Europe/Samara")  # Самара = UTC+4
 DELAY_MIN = float(os.environ.get("DELAY_MIN", 3))
 DELAY_MAX = float(os.environ.get("DELAY_MAX", 8))
+
+# 🧪 ТЕСТОВЫЙ РЕЖИМ
+# TEST_MODE = "1"  → бонус отправится ОДИН РАЗ через 2 минуты после старта
+# TEST_MODE = "0"  → обычный режим: каждый день в 07:07 по Самаре
+TEST_MODE = os.environ.get("TEST_MODE", "0") == "1"
 
 # ===== ЛОГИ =====
 logging.basicConfig(
@@ -67,8 +73,8 @@ client = TelegramClient(StringSession(SESSION_STR), API_ID, API_HASH)
 scheduler = AsyncIOScheduler()
 
 
-# ===== ЗАДАЧА: отправить "🎁Бонус" каждый день в 07:07 Самары =====
-async def daily_bonus():
+# ===== ЗАДАЧА: отправить "🎁Бонус" =====
+async def send_bonus():
     try:
         await client.send_message(TARGET_BOT, BONUS_TEXT)
         log.info(f"📨 Отправлено '{BONUS_TEXT}' в {TARGET_BOT}")
@@ -76,17 +82,31 @@ async def daily_bonus():
         log.exception(f"❌ Ошибка отправки бонуса: {e}")
 
 
+# ===== РАСПИСАНИЕ =====
 def schedule_bonus():
-    scheduler.add_job(
-        daily_bonus,
-        trigger="cron",
-        hour=BONUS_HOUR,
-        minute=BONUS_MINUTE,
-        timezone=BONUS_TZ,
-        id="daily_bonus",
-        replace_existing=True,
-    )
-    log.info(f"⏰ Задача запланирована на {BONUS_HOUR:02d}:{BONUS_MINUTE:02d} {BONUS_TZ.key}")
+    if TEST_MODE:
+        # 🧪 ТЕСТ: один раз через 2 минуты после старта
+        run_at = datetime.now(BONUS_TZ) + timedelta(minutes=2)
+        scheduler.add_job(
+            send_bonus,
+            trigger="date",
+            run_date=run_at,
+            id="test_bonus",
+            replace_existing=True,
+        )
+        log.info(f"🧪 ТЕСТ-РЕЖИМ: бонус отправится в {run_at.strftime('%H:%M:%S')} (Самара)")
+    else:
+        # ⏰ Продакшн: каждый день в 07:07 по Самаре
+        scheduler.add_job(
+            send_bonus,
+            trigger="cron",
+            hour=BONUS_HOUR,
+            minute=BONUS_MINUTE,
+            timezone=BONUS_TZ,
+            id="daily_bonus",
+            replace_existing=True,
+        )
+        log.info(f"⏰ Продакшн: бонус каждый день в {BONUS_HOUR:02d}:{BONUS_MINUTE:02d} (Самара)")
 
 
 # ===== ОБРАБОТКА КАПЧИ =====
@@ -127,6 +147,7 @@ async def handler(event):
                 log.info(f"🔘 Кнопка [{row_i}][{btn_i}]: {btn.text!r}")
 
 
+# ===== ЗАПУСК =====
 async def main():
     await client.start()
     me = await client.get_me()
