@@ -10,156 +10,258 @@ import numpy as np
 import pytesseract
 from PIL import Image
 from telethon import TelegramClient, events
+from telethon.errors import FloodWaitError, AuthKeyUnregisteredError
 from telethon.sessions import StringSession
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import zoneinfo
 
-# ===== НАСТРОЙКИ ИЗ RAILWAY VARIABLES =====
+# =========================================================
+#                     НАСТРОЙКИ
+# =========================================================
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
-SESSION_STR = os.environ["SESSION_STR"]
-TARGET_BOT = os.environ["TARGET_BOT"]          # например @bonus_bot
+TARGET_BOT = os.environ["TARGET_BOT"]
 BONUS_TEXT = os.environ.get("BONUS_TEXT", "🎁Бонус")
-BONUS_HOUR = int(os.environ.get("BONUS_HOUR", 7))
-BONUS_MINUTE = int(os.environ.get("BONUS_MINUTE", 7))
-BONUS_TZ = zoneinfo.ZoneInfo("Europe/Samara")  # Самара = UTC+4
-DELAY_MIN = float(os.environ.get("DELAY_MIN", 3))
-DELAY_MAX = float(os.environ.get("DELAY_MAX", 8))
 
-# 🧪 ТЕСТОВЫЙ РЕЖИМ
-# TEST_MODE = "1"  → бонус отправится ОДИН РАЗ через 2 минуты после старта
-# TEST_MODE = "0"  → обычный режим: каждый день в 07:07 по Самаре
+# Самара = UTC+4
+BONUS_TZ = zoneinfo.ZoneInfo("Europe/Samara")
+
+# 🧪 ТЕСТ: 1 = отправить бонус один раз через 2 минуты после старта
 TEST_MODE = os.environ.get("TEST_MODE", "0") == "1"
 
-# ===== ЛОГИ =====
+# =========================================================
+#                        ЛОГИ
+# =========================================================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 log = logging.getLogger("captcha-bot")
 
-# ===== OCR =====
+# =========================================================
+#                         OCR
+# =========================================================
 WHITELIST = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 TESS_CONFIG = f"--psm 7 -c tessedit_char_whitelist={WHITELIST}"
 
 
 def solve_captcha(image_bytes: bytes) -> str:
-    """Чистит фон и распознаёт капчу."""
+    """Распознаёт капчу, убирая фон и линии."""
     img = np.array(Image.open(BytesIO(image_bytes)).convert("RGB"))
     img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
 
-    # 1. Оставляем только белые области (белый прямоугольник с текстом)
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    lower_white = np.array([0, 0, 180])
-    upper_white = np.array([180, 60, 255])
-    mask = cv2.inRange(hsv, lower_white, upper_white)
-
-    # 2. Инвертируем — текст становится белым на чёрном
+    mask = cv2.inRange(hsv, np.array([0, 0, 180]), np.array([180, 60, 255]))
     inv = cv2.bitwise_not(mask)
 
-    # 3. Убираем линии/шум
     blur = cv2.GaussianBlur(inv, (3, 3), 0)
     _, thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    kernel = np.ones((2, 2), np.uint8)
-    cleaned = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=1)
+    cleaned = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8), iterations=1)
 
-    # 4. Распознаём
     text = pytesseract.image_to_string(cleaned, config=TESS_CONFIG)
     return text.strip().replace(" ", "").replace("\n", "")
 
 
-# ===== КЛИЕНТ =====
-client = TelegramClient(StringSession(SESSION_STR), API_ID, API_HASH)
+# =========================================================
+#                  ЗАГРУЗКА СЕССИЙ (1..15)
+# =========================================================
+SESSIONS = []
+for i in range(1, 16):
+    val = os.environ.get(f"SESSION_STR_{i}")
+    if val and val.strip():
+        SESSIONS.append((i, val.strip()))
+
+# fallback: одна SESSION_STR без номера
+if not SESSIONS and os.environ.get("SESSION_STR"):
+    SESSIONS.append((1, os.environ["SESSION_STR"].strip()))
+
+if not SESSIONS:
+    log.error("❌ Нет сессий. Добавь SESSION_STR_1, SESSION_STR_2...")
+    raise SystemExit(1)
+
+log.info(f"🔑 Загружено сессий: {len(SESSIONS)}")
+
+
+# =========================================================
+#                       КЛИЕНТЫ
+# =========================================================
+clients = [
+    (idx, TelegramClient(StringSession(sess), API_ID, API_HASH))
+    for idx, sess in SESSIONS
+]
+
+
+# =========================================================
+#                ЧЕЛОВЕЧЕСКИЕ ПАУЗЫ
+# =========================================================
+async def human_pause(min_s: float, max_s: float):
+    await asyncio.sleep(random.uniform(min_s, max_s))
+
+
+# =========================================================
+#                ОТПРАВКА БОНУСА
+# =========================================================
+async def send_bonus_one(idx: int, c: TelegramClient):
+    try:
+        # Пауза — как будто человек открыл чат
+        await human_pause(2.0, 8.0)
+
+        await c.send_message(TARGET_BOT, BONUS_TEXT)
+        log.info(f"📨 [акк {idx}] Отправлено '{BONUS_TEXT}'")
+
+    except FloodWaitError as e:
+        log.warning(f"⏳ [акк {idx}] FloodWait {e.seconds} сек")
+        await asyncio.sleep(e.seconds)
+        try:
+            await c.send_message(TARGET_BOT, BONUS_TEXT)
+            log.info(f"📨 [акк {idx}] Отправлено со 2-й попытки")
+        except Exception as e2:
+            log.error(f"❌ [акк {idx}] {e2}")
+    except AuthKeyUnregisteredError:
+        log.error(f"🚫 [акк {idx}] Сессия отозвана — обнови SESSION_STR_{idx}")
+    except Exception as e:
+        log.exception(f"❌ [акк {idx}] Ошибка: {e}")
+
+
+# =========================================================
+#                  РАСПИСАНИЕ
+# =========================================================
 scheduler = AsyncIOScheduler()
 
 
-# ===== ЗАДАЧА: отправить "🎁Бонус" =====
-async def send_bonus():
-    try:
-        await client.send_message(TARGET_BOT, BONUS_TEXT)
-        log.info(f"📨 Отправлено '{BONUS_TEXT}' в {TARGET_BOT}")
-    except Exception as e:
-        log.exception(f"❌ Ошибка отправки бонуса: {e}")
+def parse_schedule(raw: str):
+    """'09:00,17:00' → [(9,0),(17,0)]"""
+    result = []
+    if not raw:
+        return result
+    for item in raw.split(","):
+        try:
+            h, m = item.strip().split(":")
+            result.append((int(h), int(m)))
+        except Exception:
+            log.warning(f"⚠️ Неверный формат времени: {item!r}")
+    return result
 
 
-# ===== РАСПИСАНИЕ =====
 def schedule_bonus():
     if TEST_MODE:
-        # 🧪 ТЕСТ: один раз через 2 минуты после старта
-        run_at = datetime.now(BONUS_TZ) + timedelta(minutes=2)
-        scheduler.add_job(
-            send_bonus,
-            trigger="date",
-            run_date=run_at,
-            id="test_bonus",
-            replace_existing=True,
-        )
-        log.info(f"🧪 ТЕСТ-РЕЖИМ: бонус отправится в {run_at.strftime('%H:%M:%S')} (Самара)")
-    else:
-        # ⏰ Продакшн: каждый день в 07:07 по Самаре
-        scheduler.add_job(
-            send_bonus,
-            trigger="cron",
-            hour=BONUS_HOUR,
-            minute=BONUS_MINUTE,
-            timezone=BONUS_TZ,
-            id="daily_bonus",
-            replace_existing=True,
-        )
-        log.info(f"⏰ Продакшн: бонус каждый день в {BONUS_HOUR:02d}:{BONUS_MINUTE:02d} (Самара)")
+        # 🧪 ТЕСТ: каждый аккаунт отправляет один раз через 2 минуты (+0.3с между аккаунтами)
+        log.info("🧪 TEST_MODE: рассылка один раз через 2 минуты")
+        for i, (idx, c) in enumerate(clients):
+            delay_sec = 120 + i * 0.3
+            run_at = datetime.now(BONUS_TZ) + timedelta(seconds=delay_sec)
+            scheduler.add_job(
+                send_bonus_one,
+                trigger="date",
+                run_date=run_at,
+                args=[idx, c],
+                id=f"test_bonus_{idx}",
+                replace_existing=True,
+            )
+            log.info(f"🧪 [акк {idx}] тест → {run_at.strftime('%H:%M:%S')} (Самара)")
+        return
+
+    # Продакшн: слоты из SCHEDULE_N
+    log.info("⏰ Планирование задач")
+    for idx, c in clients:
+        raw = os.environ.get(f"SCHEDULE_{idx}", "07:07")
+        slots = parse_schedule(raw)
+
+        for h, m in slots:
+            scheduler.add_job(
+                send_bonus_one,
+                trigger="cron",
+                hour=h,
+                minute=m,
+                timezone=BONUS_TZ,
+                args=[idx, c],
+                id=f"bonus_{idx}_{h:02d}{m:02d}",
+                replace_existing=True,
+            )
+            log.info(f"✅ [акк {idx}] → {h:02d}:{m:02d} (Самара)")
 
 
-# ===== ОБРАБОТКА КАПЧИ =====
-@client.on(events.NewMessage(from_users=TARGET_BOT))
-async def handler(event):
-    msg = event.message
-
-    # --- Капча (картинка) ---
-    if msg.photo:
-        log.info("📩 Капча получена")
+# =========================================================
+#              ОБРАБОТЧИК КАПЧИ
+# =========================================================
+def make_handler(idx: int):
+    async def handler(event):
+        msg = event.message
         try:
-            image_bytes = await msg.download_media(bytes)
-            code = solve_captcha(image_bytes)
-            log.info(f"🔍 Распознан код: {code!r}")
+            if msg.photo:
+                log.info(f"📩 [акк {idx}] Капча получена")
 
-            if len(code) < 4:
-                log.warning("⚠️ Код слишком короткий — пропуск")
-                return
+                # Пауза — человек смотрит на картинку
+                await human_pause(2.5, 6.5)
 
-            delay = random.uniform(DELAY_MIN, DELAY_MAX)
-            log.info(f"⏳ Ждём {delay:.1f} сек (имитация человека)...")
-            await asyncio.sleep(delay)
+                image_bytes = await msg.download_media(bytes)
+                code = solve_captcha(image_bytes)
+                log.info(f"🔍 [акк {idx}] Распознан: {code!r}")
 
-            await event.reply(code)
-            log.info(f"📤 Отправлен код: {code}")
+                if len(code) < 4:
+                    log.warning(f"⚠️ [акк {idx}] Короткий код — пропуск")
+                    return
+
+                # Пауза — человек вводит код руками
+                await human_pause(1.5, 4.0)
+
+                await event.reply(code)
+                log.info(f"📤 [акк {idx}] Отправлен: {code}")
+
+                await human_pause(0.5, 1.5)
+
+            elif msg.text:
+                log.info(f"💬 [акк {idx}] Бот: {msg.text}")
 
         except Exception as e:
-            log.exception(f"❌ Ошибка обработки капчи: {e}")
+            log.error(f"❌ [акк {idx}] {e}")
 
-    # --- Текстовые сообщения от бота (для логов) ---
-    elif msg.text:
-        log.info(f"💬 Бот: {msg.text}")
-
-    # --- Логируем кнопки, если есть ---
-    if msg.buttons:
-        for row_i, row in enumerate(msg.buttons):
-            for btn_i, btn in enumerate(row):
-                log.info(f"🔘 Кнопка [{row_i}][{btn_i}]: {btn.text!r}")
+    return handler
 
 
-# ===== ЗАПУСК =====
+# =========================================================
+#                      ЗАПУСК
+# =========================================================
 async def main():
-    await client.start()
-    me = await client.get_me()
-    log.info(f"🚀 Userbot запущен как @{me.username or me.id}")
-    log.info(f"🎯 Целевой бот: {TARGET_BOT}")
+    log.info("=" * 55)
+    log.info(f"🚀 Запуск • Целевой бот: {TARGET_BOT} • Аккаунтов: {len(clients)}")
+    log.info(f"🧪 TEST_MODE: {TEST_MODE}")
+    log.info("=" * 55)
+
+    # Регистрируем обработчики капчи
+    for idx, c in clients:
+        c.add_event_handler(make_handler(idx), events.NewMessage(from_users=TARGET_BOT))
+
+    # Запускаем клиенты с паузой между ними
+    started = []
+    for i, (idx, c) in enumerate(clients):
+        try:
+            await c.start()
+            me = await c.get_me()
+            started.append((idx, c))
+            log.info(f"🚀 [акк {idx}] Запущен как @{me.username or me.id}")
+
+            if i < len(clients) - 1:
+                await human_pause(1.5, 3.5)
+        except AuthKeyUnregisteredError:
+            log.error(f"🚫 [акк {idx}] Сессия недействительна")
+        except Exception as e:
+            log.exception(f"❌ [акк {idx}] Ошибка запуска: {e}")
+
+    if not started:
+        log.error("❌ Ни один аккаунт не запустился")
+        return
+
+    clients.clear()
+    clients.extend(started)
 
     schedule_bonus()
     scheduler.start()
 
-    await client.run_until_disconnected()
+    log.info("✅ Всё готово")
+    await asyncio.gather(*(c.run_until_disconnected() for _, c in clients))
 
 
 if __name__ == "__main__":
-    with client:
-        client.loop.run_until_complete(main())
+    with clients[0][1]:
+        clients[0][1].loop.run_until_complete(main())
